@@ -42,6 +42,7 @@ final class ClickyViewModel: ObservableObject {
     let dictationManager = DictationManager()
     let accessibilityPermission = AccessibilityPermission()
     let textToSpeech = TextToSpeech()
+    let overlayManager = OverlayManager()
 
     @Published var hasAccessibilityPermission: Bool
     @Published var state: CompanionState = .idle
@@ -193,9 +194,9 @@ final class ClickyViewModel: ObservableObject {
 
     // MARK: - Turn execution
 
-    /// Captures the screen, dispatches a single turn to Claude, streams
-    /// the reply. When `thenSpeak` is true (voice-initiated turns), the
-    /// spoken text (POINT-tag-stripped) is then read aloud.
+    /// Captures ALL displays, dispatches a single turn to Claude,
+    /// streams the reply. When `thenSpeak` is true, plays TTS and then
+    /// drives the overlay cursor to any POINT target Claude emitted.
     func runTurn(userPrompt: String, thenSpeak: Bool = false) {
         guard !isRunningTurn else { return }
         currentTask?.cancel()
@@ -208,20 +209,28 @@ final class ClickyViewModel: ObservableObject {
         currentTask = Task { @MainActor in
             defer { isRunningTurn = false }
             do {
-                let frame = try await ScreenCapture.capturePrimaryDisplay()
+                let manifest = try await ScreenCapture.captureAllDisplays()
                 let binary = try ClaudeCLIRunner.locate()
                 let runner = ClaudeCLIRunner(binaryURL: binary)
                 let resume = SessionPersistence.shared.load()
 
+                // Build one ClaudeCLIMessage containing every display's
+                // JPEG + its labeled dimensions, so Claude can reason
+                // about multi-monitor layouts and emit :screenN.
+                let contentImages = manifest.screens.map {
+                    ClaudeCLIMessage.Image(
+                        mediaType: "image/jpeg",
+                        base64: $0.jpegData.base64EncodedString()
+                    )
+                }
+                let labelText = manifest.screens
+                    .map { "\($0.label) (image dimensions: \($0.widthPx)x\($0.heightPx) pixels)" }
+                    .joined(separator: "\n")
+
                 let message = ClaudeCLIMessage(
                     role: .user,
-                    text: "\(frame.label) (image dimensions: \(frame.widthPx)x\(frame.heightPx) pixels)\n\(userPrompt)",
-                    images: [
-                        ClaudeCLIMessage.Image(
-                            mediaType: "image/jpeg",
-                            base64: frame.jpegData.base64EncodedString()
-                        ),
-                    ]
+                    text: "\(labelText)\n\(userPrompt)",
+                    images: contentImages
                 )
 
                 let result = try await runner.ask(
@@ -245,10 +254,26 @@ final class ClickyViewModel: ObservableObject {
                 lastPointTag = parsed.point
                 streamingText = parsed.spokenText
 
+                // Map the tag's screenshot-pixel coords to a global
+                // AppKit CGPoint using the freshly-captured manifest.
+                let mapped = PointCoordinateMapper.map(point: parsed.point, manifest: manifest)
+
                 if thenSpeak {
                     state = .speaking
                     await textToSpeech.speak(parsed.spokenText)
                 }
+
+                // Fire the overlay AFTER TTS so the user hears
+                // "look at the save button" *before* the cursor moves —
+                // matches upstream Clicky's timing.
+                if let mapped {
+                    overlayManager.flyTo(BlueCursorTarget(
+                        globalLocation: mapped.globalLocation,
+                        displayFrame: mapped.displayFrame,
+                        label: mapped.label
+                    ))
+                }
+
                 state = .idle
             } catch is CancellationError {
                 lastError = "Cancelled."
