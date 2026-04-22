@@ -1,0 +1,233 @@
+name: Release Clicky.app
+
+# Triggers on any tag matching v*  e.g. v0.1.0, v0.2.3, v1.0.0-rc.1
+# Produces a GitHub Release with:
+#   Clicky-<version>-arm64.dmg
+#   Clicky-<version>-arm64.dmg.sha256
+#
+# Requires these repository secrets (Settings → Secrets and variables
+# → Actions). If they're missing the job builds the DMG but leaves it
+# adhoc-signed + unnotarized — fine for smoke testing, not for brew-cask
+# users.
+#
+#   APPLE_ID                  — Apple Developer Apple ID email.
+#   APPLE_APP_PASSWORD        — app-specific password from appleid.apple.com.
+#   APPLE_TEAM_ID             — 10-char Team ID (e.g. G3SBH6CVH2).
+#   SIGNING_CERTIFICATE_P12   — base64 of Developer ID Application .p12.
+#   SIGNING_CERTIFICATE_PASSWORD — password for the .p12.
+#
+# Also optional — if configured, the workflow opens a PR on the tap repo
+# to bump the cask (see Track B #24).
+#
+#   HOMEBREW_TAP_TOKEN        — PAT with `repo` scope on proyecto26/homebrew-tap.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (defaults to github.ref_name)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + codesign + notarize
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      dmg_name: ${{ steps.resolve.outputs.dmg_name }}
+      sha256:   ${{ steps.checksum.outputs.sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          if [ -z "$VERSION" ]; then
+            echo "refusing to release without a version"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=Clicky-$VERSION-arm64.dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Print toolchain
+        run: |
+          xcode-select -p
+          swift --version
+
+      - name: Import signing certificate
+        id: signing
+        if: env.SIGNING_CERTIFICATE_P12 != ''
+        env:
+          SIGNING_CERTIFICATE_P12: ${{ secrets.SIGNING_CERTIFICATE_P12 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$SIGNING_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN" \
+            -P "$SIGNING_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security \
+            -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          rm -f "$CERT_PATH"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in imported keychain"
+            security find-identity -v -p codesigning "$KEYCHAIN" || true
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          echo "keychain_password=$KEYCHAIN_PASSWORD" >> "$GITHUB_OUTPUT"
+
+      - name: Swift build + bundle
+        working-directory: native
+        env:
+          CLICKY_SIGN_IDENTITY: ${{ steps.signing.outputs.identity || '-' }}
+        run: |
+          make clean
+          make build
+          make doctor
+
+      - name: Notarize + staple (release only)
+        if: env.APPLE_ID != '' && env.SIGNING_CERTIFICATE_P12 != ''
+        working-directory: native
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          ZIP="$RUNNER_TEMP/Clicky.zip"
+          /usr/bin/ditto -c -k --keepParent Clicky.app "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id  "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple Clicky.app
+          spctl --assess --type execute --verbose=4 Clicky.app || true
+
+      - name: Build DMG + SHA256
+        working-directory: native
+        run: |
+          make dmg VERSION=${{ steps.resolve.outputs.version }}
+          ls -la "${{ steps.resolve.outputs.dmg_name }}" "${{ steps.resolve.outputs.dmg_name }}.sha256"
+
+      - name: Compute SHA256 (output)
+        id: checksum
+        working-directory: native
+        run: |
+          SHA=$(cat "${{ steps.resolve.outputs.dmg_name }}.sha256")
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artefacts for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: clicky-dmg
+          path: |
+            native/${{ steps.resolve.outputs.dmg_name }}
+            native/${{ steps.resolve.outputs.dmg_name }}.sha256
+          retention-days: 7
+
+      - name: Delete temp keychain
+        if: always() && steps.signing.outputs.keychain_password != ''
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: clicky-dmg
+          path: .
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${{ needs.build.outputs.version }}"
+          DMG="${{ needs.build.outputs.dmg_name }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Clicky $VERSION" --notes "Automated release. See docs/plan/ for change audit."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "native/$DMG" "native/$DMG.sha256"
+
+  bump-tap:
+    name: Open PR on Homebrew tap (optional)
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - name: Check out tap
+        uses: actions/checkout@v4
+        with:
+          repository: proyecto26/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update cask formula
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256:  ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          FORMULA="tap/Casks/clicky-ai.rb"
+          if [ ! -f "$FORMULA" ]; then
+            echo "Formula missing at $FORMULA — seed it from clicky-ai-plugin/casks/clicky-ai.rb first."
+            exit 1
+          fi
+          sed -E -i '' \
+            -e "s|^( *version *\").*(\")|\1${VERSION}\2|" \
+            -e "s|^( *sha256 *\").*(\")|\1${SHA256}\2|" \
+            "$FORMULA" || python3 -c "
+import re, sys
+p = 'tap/Casks/clicky-ai.rb'
+s = open(p).read()
+s = re.sub(r'(version\\s+\")[^\"]+(\")', r'\\g<1>${VERSION}\\g<2>', s)
+s = re.sub(r'(sha256\\s+\")[^\"]+(\")', r'\\g<1>${SHA256}\\g<2>', s)
+open(p,'w').write(s)
+"
+          cd tap
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          BRANCH="clicky-ai-$VERSION"
+          git checkout -b "$BRANCH"
+          git add Casks/clicky-ai.rb
+          git commit -m "clicky-ai $VERSION"
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cd tap
+          gh pr create --fill \
+            --title "clicky-ai $VERSION" \
+            --body "Automated bump from proyecto26/clicky-ai-plugin release."

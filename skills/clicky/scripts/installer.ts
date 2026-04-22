@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, unlinkSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
+import { createWriteStream, existsSync, unlinkSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createHash } from 'node:crypto';
@@ -7,7 +7,7 @@ import { assertDarwin, resolveDownloadsDir, ensureDir } from './paths.ts';
 import type { InstallResult } from './types.ts';
 
 export const CLICKY_TAP = 'proyecto26/tap/clicky-ai';
-export const CLICKY_RELEASE_REPO = 'proyecto26/clicky';
+export const CLICKY_RELEASE_REPO = 'proyecto26/clicky-ai-plugin';
 export const INSTALLED_PATH = '/Applications/Clicky.app';
 
 export interface InstallOptions {
